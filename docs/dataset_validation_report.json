@@ -1,0 +1,17 @@
+{
+  "tickets": {
+    "dataset": "tickets",
+    "rows": 1200,
+    "output": "/home/user/output/gemini-hackathon-usecases/data/clean/tickets_clean.csv"
+  },
+  "requirements": {
+    "dataset": "requirements",
+    "rows": 1200,
+    "output": "/home/user/output/gemini-hackathon-usecases/data/clean/requirements_clean.csv"
+  },
+  "logs": {
+    "dataset": "logs",
+    "rows": 1200,
+    "output": "/home/user/output/gemini-hackathon-usecases/data/clean/logs_clean.csv"
+  }
+}
