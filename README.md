@@ -231,3 +231,37 @@ git push -u origin main
 | Ingest real PagerDuty logs | Replace the CSV with a PagerDuty webhook payload |
 | Add batch retry logic | Wrap the API call in a retry loop with exponential backoff |
 | Fine-tune prompts by app | Add a `prompt_templates/` folder with per-product-area templates |
+
+---
+
+## Streamlit UI
+
+A multi-page Streamlit app wraps all three use cases with a browser-based interface.
+
+### Run locally
+
+```bash
+pip install -r requirements.txt
+export GEMINI_API_KEY=your_key_here   # Windows: $env:GEMINI_API_KEY="..."
+
+streamlit run app.py
+```
+
+Your browser will open at **http://localhost:8501** automatically.
+
+### Pages
+
+| Page | File | What it does |
+|---|---|---|
+| 🏠 Home | `app.py` | Overview + architecture diagram |
+| 🎫 Ticket Triage | `pages/1_ticket_triage.py` | Paste ticket or load from CSV → priority, team, reply |
+| 📋 Sprint Planner | `pages/2_sprint_planner.py` | Paste requirement → stories, criteria, test cases |
+| 🔍 Log Explainer | `pages/3_log_explainer.py` | Paste log chunk → root cause, evidence, runbook |
+
+### Key UI features
+
+- **API key in sidebar** — enters once, persists across all pages for the session.
+- **Dual input modes** — type/paste live text, or pick any row from the 1,200-row clean CSV.
+- **Structured output display** — metrics, color-coded severity badges, expandable story cards.
+- **Download buttons** — every result exports as JSON and/or Markdown (Confluence-ready).
+- **Input & output validation** — errors shown inline with Streamlit `st.error()`.
