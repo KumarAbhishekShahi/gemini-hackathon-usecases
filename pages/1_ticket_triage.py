@@ -3,23 +3,17 @@ pages/1_ticket_triage.py
 ========================
 Streamlit page for Use Case 1: Support Ticket Triage.
 
-Uses the Gemini REST API via the 'requests' library — no gRPC, no google-genai SDK.
+Uses the shared Gemini REST client (src/common/gemini_client.py) which handles:
+  - 429 retryDelay parsing from response body
+  - Exponential backoff with full jitter (base=15 s, max=120 s)
+  - Inter-request throttle (6.5 s gap, safe for free-tier 10 RPM)
 
-Why REST over gRPC?
-  - No binary dependencies (grpcio) — installs cleanly everywhere.
-  - Plain HTTP/JSON — trivial to inspect, log, or proxy.
-  - Works the same in Streamlit Cloud, local laptops, and CI pipelines.
-  - Structured output is controlled via 'responseSchema' in generationConfig.
-
-Modes:
-  - Manual input : Paste any ticket text and analyse it instantly.
-  - CSV batch    : Pick a row from tickets_clean.csv and analyse it.
+The Streamlit spinner and status messages show live wait feedback.
 """
 
 import json
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Literal
 
@@ -28,15 +22,16 @@ import requests
 import streamlit as st
 from pydantic import BaseModel, Field, ValidationError
 
-# ── Path setup ─────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-# ── Page config ────────────────────────────────────────────────────────────
+# Shared REST client — handles all 429 / retry / throttle logic.
+from src.common.gemini_client import call_gemini_rest as _rest_call
+
 st.set_page_config(page_title="Ticket Triage", page_icon="🎫", layout="wide")
 
-# ── Sidebar: persist API key ───────────────────────────────────────────────
+# ── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.image(
         "https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a690345.svg",
@@ -54,13 +49,10 @@ with st.sidebar:
         st.session_state["gemini_api_key"] = api_key_input
     st.markdown("---")
     st.caption("Transport: **REST (requests)** — no gRPC.")
+    st.caption("Free tier: **10 RPM** — client throttles automatically.")
 
-# ── REST config ────────────────────────────────────────────────────────────
-GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
-GEMINI_MODEL     = "gemini-2.0-flash"
-GEMINI_ENDPOINT  = f"{GEMINI_REST_BASE}/models/{GEMINI_MODEL}:generateContent"
-MAX_RETRIES      = 3
-RETRY_BACKOFF_S  = 2
+# ── Config ────────────────────────────────────────────────────────────────
+GEMINI_MODEL = "gemini-2.0-flash"
 
 # ── Pydantic schema ────────────────────────────────────────────────────────
 class TicketAnalysis(BaseModel):
@@ -74,110 +66,21 @@ class TicketAnalysis(BaseModel):
     confidence: int = Field(ge=1, le=100)
 
 
-# ── REST caller ────────────────────────────────────────────────────────────
-
-def build_request_body(prompt: str) -> dict:
-    """
-    Build the JSON payload for the Gemini generateContent REST endpoint.
-
-    generationConfig.responseSchema constrains the model to only return
-    JSON that matches our TicketAnalysis Pydantic model.
-    """
-    return {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
-        "generationConfig": {
-            # Ask Gemini to return JSON, not prose.
-            "responseMimeType": "application/json",
-            # Pass the full JSON Schema so Gemini knows every field name,
-            # type, and allowed enum value.
-            "responseSchema": TicketAnalysis.model_json_schema(),
-        },
-    }
-
-
-def call_gemini_rest(prompt: str, api_key: str) -> str:
-    """
-    Send the prompt to Gemini via HTTP POST and return the raw JSON string.
-
-    The Gemini REST response looks like:
-    {
-      "candidates": [
-        {
-          "content": {
-            "parts": [{ "text": "<json here>" }]
-          }
-        }
-      ]
-    }
-
-    We navigate that structure and return the inner text.
-
-    Raises:
-        requests.HTTPError : For unrecoverable HTTP errors.
-        ValueError         : For unexpected response shapes.
-    """
-    # API key goes in the query string — no OAuth, no bearer token needed.
-    url = f"{GEMINI_ENDPOINT}?key={api_key}"
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
-    }
-
-    body = build_request_body(prompt)
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        # Make the HTTP POST request.
-        response = requests.post(
-            url,
-            headers=headers,
-            json=body,         # requests auto-serialises dict → JSON body
-            timeout=(10, 60),  # (connect_timeout, read_timeout) in seconds
-        )
-
-        # Retry on rate-limit (429) or server overload (503).
-        if response.status_code in (429, 503) and attempt < MAX_RETRIES:
-            wait = RETRY_BACKOFF_S * (2 ** (attempt - 1))
-            time.sleep(wait)
-            continue
-
-        # Raise for 4xx/5xx that are not retriable.
-        response.raise_for_status()
-
-        # Navigate the nested response envelope to get the generated text.
-        try:
-            generated_text = (
-                response.json()["candidates"][0]["content"]["parts"][0]["text"]
-            )
-        except (KeyError, IndexError) as e:
-            raise ValueError(
-                f"Unexpected Gemini response structure: {e}. "
-                f"Raw: {json.dumps(response.json(), indent=2)[:500]}"
-            )
-
-        return generated_text
-
-    raise requests.HTTPError(f"All {MAX_RETRIES} retry attempts failed.")
-
+# ── Call helper ────────────────────────────────────────────────────────────
 
 def call_and_parse(
-    subject: str,
-    body: str,
-    tier: str,
-    app_module: str,
-    platform: str,
-    region: str,
+    subject: str, body: str,
+    tier: str, app_module: str, platform: str, region: str,
     api_key: str,
+    status_placeholder,
 ) -> TicketAnalysis:
     """
-    Build prompt → call REST API → validate with Pydantic → return result.
-    Raises ValueError or ValidationError on failure.
+    Build prompt → call shared REST client → validate with Pydantic.
+
+    'status_placeholder' is an st.empty() so we can update the spinner
+    message with live 429 wait feedback without re-rendering the whole page.
     """
+
     prompt = f"""You are a senior support triage assistant for a SaaS software company.
 
 Context:
@@ -192,31 +95,42 @@ Body:
 {body}
 
 Instructions:
-- Classify the ticket accurately using only the information provided.
-- Be conservative. Do not invent reproduction steps.
+- Classify using only information provided. Be conservative.
+- Do not invent reproduction steps.
 - Priority must reflect business impact.
 - Suggested reply must be polite, professional, and actionable.
 - Confidence is an integer 1-100.
 """
-    raw_json = call_gemini_rest(prompt, api_key)
+    # log_fn forwards Gemini client log messages to the Streamlit status area.
+    def st_log(msg: str) -> None:
+        # Show 429 wait messages prominently; others as debug text.
+        if "429" in msg or "RATE LIMITED" in msg or "THROTTLE" in msg or "Waiting" in msg:
+            status_placeholder.warning(f"⏳ {msg}", icon="⏳")
+        else:
+            status_placeholder.info(f"🔄 {msg}")
+
+    raw_json = _rest_call(
+        prompt  = prompt,
+        api_key = api_key,
+        schema  = TicketAnalysis.model_json_schema(),
+        model   = GEMINI_MODEL,
+        log_fn  = st_log,
+    )
     return TicketAnalysis.model_validate_json(raw_json)
 
 
 # ── Display helpers ────────────────────────────────────────────────────────
-PRIORITY_ICON = {"critical":"🔴","high":"🟠","medium":"🟡","low":"🟢"}
-TEAM_ICON     = {
-    "frontend":"🖥️","backend":"⚙️","qa":"🧪","devops":"🚀",
-    "security":"🔒","support":"💬","product":"📦","unknown":"❓",
+PRIORITY_ICON = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
+TEAM_ICON = {
+    "frontend": "🖥️", "backend": "⚙️", "qa": "🧪", "devops": "🚀",
+    "security": "🔒", "support": "💬", "product": "📦", "unknown": "❓",
 }
 
 def render_result(result: TicketAnalysis) -> None:
-    """Display the structured triage result as a rich Streamlit layout."""
-
-    # ── Top metrics ──────────────────────────────────────────────────────────
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Priority",   f"{PRIORITY_ICON.get(result.priority,'')} {result.priority.upper()}")
-    m2.metric("Category",   result.category.replace("_"," ").title())
-    m3.metric("Team",       f"{TEAM_ICON.get(result.likely_team,'')} {result.likely_team}")
+    m1.metric("Priority",   f"{PRIORITY_ICON.get(result.priority, '')} {result.priority.upper()}")
+    m2.metric("Category",   result.category.replace("_", " ").title())
+    m3.metric("Team",       f"{TEAM_ICON.get(result.likely_team, '')} {result.likely_team}")
     m4.metric("Confidence", f"{result.confidence}/100")
 
     st.markdown("---")
@@ -238,19 +152,14 @@ def render_result(result: TicketAnalysis) -> None:
 
     with col_r:
         st.markdown("#### 💬 Suggested Reply")
-        st.text_area(
-            "Copy and send this reply:",
-            value=result.suggested_reply,
-            height=220,
-            key="reply_box",
-        )
+        st.text_area("Copy and send this reply:", value=result.suggested_reply, height=220, key="reply_box")
 
-    # ── Debug expander: show raw HTTP request body ───────────────────────────
-    with st.expander("🛠️ Debug — Raw request & response JSON"):
-        st.markdown("**Request payload sent to Gemini REST API:**")
-        sample_body = build_request_body("<prompt was sent here — see above>")
-        st.code(json.dumps(sample_body, indent=2), language="json")
-        st.markdown("**Response parsed into:**")
+    with st.expander("🛠️ Debug — Request schema sent to Gemini REST API"):
+        st.code(
+            json.dumps(TicketAnalysis.model_json_schema(), indent=2),
+            language="json"
+        )
+        st.markdown("**Parsed output:**")
         st.code(result.model_dump_json(indent=2), language="json")
 
     st.markdown("---")
@@ -262,24 +171,27 @@ def render_result(result: TicketAnalysis) -> None:
     )
 
 
-# ── Main page ──────────────────────────────────────────────────────────────
-st.title("🎫 Use Case 1: Support Ticket Triage")
-st.caption(
-    "Raw ticket text → priority, team routing, and a draft reply.  "
-    "**Transport: Gemini REST API via `requests` (no gRPC).**"
+# ── Rate-limit info banner ─────────────────────────────────────────────────
+st.info(
+    "**Free-tier rate limit:** `gemini-2.0-flash` = **10 RPM** "
+    "(1 request per 6 seconds).  "
+    "The client throttles automatically and reads `retryDelay` from 429 responses. "
+    "No action needed on your end.",
+    icon="ℹ️",
 )
 
-# ── Input mode ─────────────────────────────────────────────────────────────
-mode = st.radio(
-    "Input mode:", ["✍️ Type / Paste ticket", "📂 Load from CSV"], horizontal=True
+# ── Main ───────────────────────────────────────────────────────────────────
+st.title("🎫 Use Case 1: Support Ticket Triage")
+st.caption(
+    "Raw ticket text → priority, team, draft reply.  "
+    "**Transport: Gemini REST API via `requests` (no gRPC) · 429-safe client.**"
 )
+
+mode = st.radio("Input mode:", ["✍️ Type / Paste ticket", "📂 Load from CSV"], horizontal=True)
 
 if mode == "✍️ Type / Paste ticket":
     with st.form("manual_form"):
-        subject_in = st.text_input(
-            "Subject / Title",
-            value="Checkout stuck after coupon apply",
-        )
+        subject_in = st.text_input("Subject / Title", value="Checkout stuck after coupon apply")
         body_in = st.text_area(
             "Ticket body",
             value=(
@@ -291,31 +203,41 @@ if mode == "✍️ Type / Paste ticket":
             height=160,
         )
         c1, c2, c3, c4 = st.columns(4)
-        tier_in    = c1.selectbox("Customer tier", ["free","pro","enterprise"], index=1)
-        app_in     = c2.selectbox("App module", ["checkout","billing","identity","orders","documents","analytics"])
-        platform_in = c3.selectbox("Platform", ["web","android","ios","desktop"])
-        region_in  = c4.selectbox("Region", ["IN","US","EU","APAC","MEA"])
-        submitted  = st.form_submit_button("🚀 Analyse with Gemini", type="primary")
+        tier_in     = c1.selectbox("Customer tier",  ["free", "pro", "enterprise"], index=1)
+        app_in      = c2.selectbox("App module",     ["checkout", "billing", "identity", "orders", "documents", "analytics"])
+        platform_in = c3.selectbox("Platform",       ["web", "android", "ios", "desktop"])
+        region_in   = c4.selectbox("Region",         ["IN", "US", "EU", "APAC", "MEA"])
+        submitted   = st.form_submit_button("🚀 Analyse with Gemini", type="primary")
 
     if submitted:
-        key = st.session_state.get("gemini_api_key","")
+        key = st.session_state.get("gemini_api_key", "")
         if not subject_in.strip() or not body_in.strip():
             st.error("Subject and body are required.")
         elif not key:
             st.error("Enter your Gemini API key in the sidebar first.")
         else:
+            status = st.empty()   # live status placeholder for retry messages
             with st.spinner("Calling Gemini REST API…"):
                 try:
                     result = call_and_parse(
-                        subject_in, body_in, tier_in, app_in, platform_in, region_in, key
+                        subject_in, body_in, tier_in, app_in, platform_in, region_in,
+                        key, status,
                     )
+                    status.empty()
                     st.success("Analysis complete!", icon="✅")
                     render_result(result)
                 except requests.HTTPError as e:
-                    st.error(f"HTTP error calling Gemini: {e}")
+                    status.empty()
+                    st.error(
+                        f"HTTP error: {e}\n\n"
+                        "If this is a 429 that persisted after all retries, "
+                        "wait ~60 s and try again, or reduce request frequency."
+                    )
                 except requests.Timeout:
-                    st.error("Request timed out. Check your network and try again.")
+                    status.empty()
+                    st.error("Request timed out. Check your network and retry.")
                 except (ValidationError, ValueError) as e:
+                    status.empty()
                     st.error(f"Validation / response error: {e}")
 
 else:
@@ -325,42 +247,42 @@ else:
     else:
         df = pd.read_csv(csv_path)
         st.info(f"Loaded **{len(df):,} tickets** from `data/clean/tickets_clean.csv`")
-
         row_idx = st.slider("Select ticket row", 0, min(len(df) - 1, 999), 0)
         row = df.iloc[row_idx]
 
         with st.expander("👁️ Preview raw row", expanded=True):
             c1, c2 = st.columns(2)
             c1.markdown(f"**Ticket ID:** `{row['ticket_id']}`")
-            c1.markdown(f"**App:** {row.get('app','—')}  |  **Platform:** {row.get('platform','—')}")
+            c1.markdown(f"**App:** {row.get('app', '—')}  |  **Platform:** {row.get('platform', '—')}")
             c2.markdown(f"**Subject:** {row['subject']}")
-            c2.markdown(f"**Tier:** {row.get('customer_tier','—')}  |  **Region:** {row.get('region','—')}")
-            st.text_area(
-                "Body", value=str(row["body"]), height=120,
-                disabled=True, key="csv_body_preview"
-            )
+            c2.markdown(f"**Tier:** {row.get('customer_tier', '—')}  |  **Region:** {row.get('region', '—')}")
+            st.text_area("Body", value=str(row["body"]), height=120, disabled=True, key="csv_body_preview")
 
         if st.button("🚀 Analyse this ticket with Gemini", type="primary"):
-            key = st.session_state.get("gemini_api_key","")
+            key = st.session_state.get("gemini_api_key", "")
             if not key:
                 st.error("Enter your Gemini API key in the sidebar first.")
             else:
+                status = st.empty()
                 with st.spinner("Calling Gemini REST API…"):
                     try:
                         result = call_and_parse(
-                            str(row["subject"]),
-                            str(row["body"]),
-                            str(row.get("customer_tier","pro")),
-                            str(row.get("app","orders")),
-                            str(row.get("platform","web")),
-                            str(row.get("region","IN")),
-                            key,
+                            str(row["subject"]), str(row["body"]),
+                            str(row.get("customer_tier", "pro")),
+                            str(row.get("app", "orders")),
+                            str(row.get("platform", "web")),
+                            str(row.get("region", "IN")),
+                            key, status,
                         )
+                        status.empty()
                         st.success("Analysis complete!", icon="✅")
                         render_result(result)
                     except requests.HTTPError as e:
-                        st.error(f"HTTP error calling Gemini: {e}")
+                        status.empty()
+                        st.error(f"HTTP error: {e}")
                     except requests.Timeout:
-                        st.error("Request timed out. Check your network and try again.")
+                        status.empty()
+                        st.error("Request timed out.")
                     except (ValidationError, ValueError) as e:
+                        status.empty()
                         st.error(f"Validation / response error: {e}")
