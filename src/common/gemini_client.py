@@ -1,266 +1,282 @@
 """
 src/common/gemini_client.py
 ============================
-Shared Gemini REST client with production-grade 429 handling.
+Shared Gemini REST client — handles 400/429/500/503 robustly.
 
-Why a shared module?
-  Both the CLI scripts and the Streamlit pages call the same REST endpoint.
-  Centralising retry/backoff/throttle logic here means one fix applies everywhere.
+ROOT CAUSE OF HTTP 400  ← THIS IS WHAT BROKE sprint_planner
+---------------------------------------------------------------
+Pydantic v2's model_json_schema() emits $defs + $ref for every
+nested model.  Example for SprintPlan (contains List[Story]):
 
-Root cause of 429 RESOURCE_EXHAUSTED:
-  The free-tier Gemini API enforces a rolling-60-second window:
-    gemini-2.0-flash : 10 RPM  (= 1 request every 6 seconds minimum)
-    gemini-2.5-flash : 10 RPM
-    gemini-2.5-pro   :  5 RPM
-  The previous code retried at 2s → 4s, which is far too short to clear the
-  60-second rate-limit window.
+  { "$defs": { "Story": {...} },
+    "properties": {
+      "stories": { "items": { "$ref": "#/$defs/Story" } }
+    }
+  }
 
-Three-layer fix implemented here:
-  Layer 1 — Parse retryDelay from Gemini's 429 response body
-    Gemini returns a structured error like:
-      {"error": {"details": [{"retryDelay": "30s", "@type": "...RetryInfo"}]}}
-    We read that value and wait AT LEAST that long before retrying.
+Gemini REST API accepts only a flat OpenAPI-like schema.
+Sending $defs / $ref produces:
+  HTTP 400 — "Unknown name \"$defs\" at generation_config.response_schema"
+  HTTP 400 — "Unknown name \"$ref\" at ...items"
 
-  Layer 2 — Exponential backoff with full jitter
-    wait = min(BASE * 2^attempt, MAX_WAIT) + random(0, JITTER)
-    Jitter prevents all parallel callers from retrying simultaneously
-    (thundering-herd problem).
+FIX: _resolve_schema() walks the entire tree, inlines every $ref,
+drops $defs, and strips unsupported keys (title, $schema) before
+the body is sent.  This is applied automatically inside call_gemini_rest.
 
-  Layer 3 — Inter-request throttle (MIN_INTERVAL)
-    A module-level timestamp ensures we never fire two requests within
-    MIN_INTERVAL seconds of each other, regardless of retries.
-    For 10 RPM the interval is set to 6.5 s (slightly above 6 s for safety).
+Error guide
+-----------
+  400  BAD_REQUEST          → schema has $ref/$defs OR bad field names
+                               → auto-fixed by _resolve_schema()
+  429  RESOURCE_EXHAUSTED   → free-tier 10 RPM quota hit
+                               → long back-off with server retryDelay hint
+  503  SERVICE_UNAVAILABLE  → model overloaded
+                               → same long back-off + model fallback chain
+  500  INTERNAL_SERVER_ERROR→ transient; retry with back-off
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import random
-import sys
 import time
 from typing import Callable
 
 import requests
 
-# ── Rate-limit constants (tuned for free-tier gemini-2.0-flash) ───────────────
-# 10 RPM = 1 request per 6 s.  We use 6.5 s to add a small safety margin.
-MIN_INTERVAL   : float = 6.5    # minimum seconds between consecutive requests
-BASE_BACKOFF_S : float = 15.0   # starting wait on first retry after 429
-MAX_BACKOFF_S  : float = 120.0  # cap so we never wait more than 2 minutes
-JITTER_S       : float = 3.0    # random extra seconds to avoid thundering herd
-MAX_RETRIES    : int   = 5      # total retry attempts before giving up
+# ── Constants ─────────────────────────────────────────────────────────────────
+MIN_INTERVAL   : float = 6.5    # seconds between requests (10 RPM free tier)
+BASE_BACKOFF_S : float = 20.0   # start high — 503 needs longer waits than 429
+MAX_BACKOFF_S  : float = 120.0
+JITTER_S       : float = 4.0
+MAX_RETRIES    : int   = 5
 
-# ── Gemini REST base ──────────────────────────────────────────────────────────
 GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-# ── Module-level throttle: timestamp of the last outgoing request ─────────────
-# This persists for the lifetime of the process (or Streamlit session),
-# so every call through this module respects the 10 RPM limit automatically.
+DEFAULT_FALLBACK_MODELS: list[str] = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
+# Keys Gemini's schema parser rejects (JSON Schema but not OpenAPI)
+_STRIP_KEYS = frozenset({"$schema"})  # "title" removed: it is also a valid field name in Pydantic models
+
+# ── Module-level throttle ─────────────────────────────────────────────────────
 _last_request_ts: float = 0.0
 
 
-def _parse_retry_delay(response: requests.Response) -> float | None:
-    """
-    Extract the retryDelay field Gemini embeds inside 429 response bodies.
+# ── Schema flattener (fixes HTTP 400) ─────────────────────────────────────────
 
-    Gemini error body shape:
-    {
-      "error": {
-        "code": 429,
-        "status": "RESOURCE_EXHAUSTED",
-        "details": [
-          {
-            "@type": "type.googleapis.com/google.rpc.RetryInfo",
-            "retryDelay": "30s"
-          }
-        ]
-      }
-    }
-
-    Returns the delay in seconds as a float, or None if not present.
+def _resolve_schema(schema: dict) -> dict:
     """
-    try:
-        details = response.json().get("error", {}).get("details", [])
-        for item in details:
-            delay_str = item.get("retryDelay", "")
-            if delay_str.endswith("s"):
-                return float(delay_str[:-1])
-    except (ValueError, KeyError, AttributeError):
-        pass
-    return None
+    Flatten a Pydantic JSON Schema so Gemini REST accepts it.
 
+    Pydantic v2 puts nested models in $defs and references them with $ref.
+    Gemini does not support $ref or $defs — it needs a fully inlined schema.
+    This function resolves every $ref recursively and drops $defs.
 
-def _parse_retry_after_header(response: requests.Response) -> float | None:
+    Also strips 'title' and '$schema' keys which Gemini rejects.
     """
-    Read the HTTP Retry-After header that some Google services send.
-    Value can be an integer number of seconds or an HTTP-date string.
-    We only handle the integer form.
-    """
-    header_val = response.headers.get("Retry-After", "")
-    try:
-        return float(header_val)
-    except (ValueError, TypeError):
-        return None
+    schema = copy.deepcopy(schema)
+    defs   = schema.pop("$defs", {})
+
+    def _resolve(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                # "#/$defs/Story" → "Story"
+                ref_name = node["$ref"].split("/")[-1]
+                resolved = copy.deepcopy(defs.get(ref_name, {}))
+                # Merge any sibling keys (allOf patterns etc.)
+                for k, v in node.items():
+                    if k != "$ref":
+                        resolved[k] = v
+                return _resolve(resolved)
+            return {k: _resolve(v) for k, v in node.items() if k not in _STRIP_KEYS}
+        elif isinstance(node, list):
+            return [_resolve(item) for item in node]
+        return node
+
+    flat = _resolve(schema)
+    flat.pop("$defs", None)    # remove any that crept back in
+    return flat
 
 
-def _throttle(log_fn: Callable[[str], None] | None = None) -> None:
-    """
-    Enforce MIN_INTERVAL between requests by sleeping if needed.
-    Called BEFORE every outgoing HTTP request.
-    """
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _log_default(msg: str) -> None:
+    print(f"    {msg}", flush=True)
+
+
+def _throttle(log_fn: Callable[[str], None]) -> None:
     global _last_request_ts
     now  = time.monotonic()
     wait = MIN_INTERVAL - (now - _last_request_ts)
     if wait > 0:
-        msg = f"[THROTTLE] Waiting {wait:.1f}s to respect 10 RPM limit…"
-        if log_fn:
-            log_fn(msg)
-        else:
-            print(msg)
+        log_fn(f"[THROTTLE] Spacing requests — waiting {wait:.1f}s (10 RPM limit)…")
         time.sleep(wait)
     _last_request_ts = time.monotonic()
 
 
-def call_gemini_rest(
-    prompt:         str,
-    api_key:        str,
-    schema:         dict,
-    model:          str  = "gemini-2.0-flash",
-    log_fn:         Callable[[str], None] | None = None,
-    progress_fn:    Callable[[str, int], None]   | None = None,
-) -> str:
+def _parse_retry_delay(response: requests.Response) -> float | None:
+    try:
+        details = response.json().get("error", {}).get("details", [])
+        for item in details:
+            val = item.get("retryDelay", "")
+            if isinstance(val, str) and val.endswith("s"):
+                return float(val[:-1])
+    except Exception:
+        pass
+    return None
+
+
+def _compute_wait(attempt: int, server_hint: float | None) -> float:
+    exp    = min(BASE_BACKOFF_S * (2 ** (attempt - 1)), MAX_BACKOFF_S)
+    jitter = random.uniform(0, JITTER_S)
+    return max(server_hint or 0.0, exp) + jitter
+
+
+# ── Single-model call ─────────────────────────────────────────────────────────
+
+def _call_one_model(
+    model:       str,
+    prompt:      str,
+    api_key:     str,
+    schema:      dict,
+    log_fn:      Callable[[str], None],
+    progress_fn: Callable[[str, int], None] | None,
+) -> str | None:
     """
-    Call the Gemini generateContent REST endpoint and return the raw JSON string.
-
-    Parameters
-    ----------
-    prompt      : The full prompt string to send.
-    api_key     : Gemini API key (from GEMINI_API_KEY env var or Streamlit state).
-    schema      : Pydantic model's .model_json_schema() — passed as responseSchema.
-    model       : Gemini model name (default: gemini-2.0-flash).
-    log_fn      : Optional callable(msg: str) for custom logging (e.g. st.info).
-    progress_fn : Optional callable(msg: str, pct: int) for progress bars.
-
-    Returns
-    -------
-    Raw JSON string from Gemini (to be validated by your Pydantic model).
-
-    Raises
-    ------
-    requests.HTTPError : If all retries are exhausted.
-    ValueError         : If the response structure is unexpected.
+    Returns JSON string on success.
+    Returns None if 503 retries exhausted (trigger fallback).
+    Raises requests.HTTPError for non-retriable errors.
     """
-    def _log(msg: str) -> None:
-        if log_fn:
-            log_fn(msg)
-        else:
-            print(f"    {msg}")
+    url  = f"{GEMINI_REST_BASE}/models/{model}:generateContent?key={api_key}"
+    hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
 
-    # Full endpoint URL — API key in query param, no OAuth needed.
-    url = f"{GEMINI_REST_BASE}/models/{model}:generateContent?key={api_key}"
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
-    }
+    # ── Flatten schema BEFORE building body ──────────────────────────────────
+    # This resolves $ref/$defs so Gemini REST accepts nested Pydantic models.
+    flat_schema = _resolve_schema(schema)
+    log_fn("[SCHEMA] $ref/$defs resolved — flat schema ready for Gemini.")
 
     body = {
-        "contents": [
-            {"role": "user", "parts": [{"text": prompt}]}
-        ],
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
-            # Tell Gemini: return structured JSON, not prose.
             "responseMimeType": "application/json",
-            # Pass the full Pydantic JSON Schema so Gemini constrains
-            # its output to exactly the fields and types you defined.
-            "responseSchema": schema,
+            "responseSchema":   flat_schema,
         },
     }
 
-    for attempt in range(1, MAX_RETRIES + 2):  # +2 so last attempt fires, then we raise
-        # ── Layer 3: Throttle ────────────────────────────────────────────────
-        # Always enforce the min-interval between requests,
-        # whether this is the first call or a retry.
-        _throttle(log_fn=_log)
+    for attempt in range(1, MAX_RETRIES + 2):
+        _throttle(log_fn)
 
-        _log(f"[HTTP] POST …/{model}:generateContent (attempt {attempt}/{MAX_RETRIES + 1})")
+        log_fn(f"[HTTP] POST {GEMINI_REST_BASE}/models/{model}:generateContent "
+               f"(attempt {attempt}/{MAX_RETRIES + 1})")
+
         if progress_fn:
-            pct = int(100 * attempt / (MAX_RETRIES + 1))
-            progress_fn(f"Attempt {attempt} / {MAX_RETRIES + 1}", pct)
+            progress_fn(
+                f"Model: {model}  |  Attempt {attempt} / {MAX_RETRIES + 1}",
+                int(80 * attempt / (MAX_RETRIES + 1)),
+            )
 
-        response = requests.post(
-            url,
-            headers=headers,
-            json=body,
-            timeout=(10, 60),
-        )
+        resp = requests.post(url, headers=hdrs, json=body, timeout=(10, 60))
+        log_fn(f"[HTTP] Status: {resp.status_code}")
 
-        _log(f"[HTTP] Status: {response.status_code}")
-
-        # ── 429: Rate limited ────────────────────────────────────────────────
-        if response.status_code == 429:
+        # 429 — rate limited
+        if resp.status_code == 429:
             if attempt > MAX_RETRIES:
-                # Exhausted all retries — raise so the caller can surface the error.
-                response.raise_for_status()
-
-            # ── Layer 1: Parse retryDelay from the response body ─────────────
-            server_delay = _parse_retry_delay(response)
-            header_delay = _parse_retry_after_header(response)
-            server_hint  = server_delay or header_delay
-
-            # ── Layer 2: Exponential backoff with jitter ─────────────────────
-            # Formula: min(BASE * 2^(attempt-1), MAX_WAIT) + jitter
-            exp_wait = min(BASE_BACKOFF_S * (2 ** (attempt - 1)), MAX_BACKOFF_S)
-            jitter   = random.uniform(0, JITTER_S)
-
-            # Use the LARGER of server hint and our exponential wait.
-            # Never wait less than what Gemini explicitly asks for.
-            wait = max(server_hint or 0.0, exp_wait) + jitter
-
-            _log(
-                f"[429] RATE LIMITED. "
-                f"server_hint={server_hint}s  exp_backoff={exp_wait:.0f}s  "
-                f"jitter={jitter:.1f}s  → waiting {wait:.1f}s before retry."
-            )
-            _log(
-                f"[TIP] Free tier = 10 RPM. To avoid 429s: process fewer rows, "
-                f"or upgrade to a paid tier (150 RPM)."
-            )
-
+                resp.raise_for_status()
+            hint = _parse_retry_delay(resp)
+            wait = _compute_wait(attempt, hint)
+            log_fn(f"[429] RATE LIMITED — server_hint={hint}s → waiting {wait:.1f}s")
             time.sleep(wait)
             continue
 
-        # ── 503 / 500: Server-side transient errors ──────────────────────────
-        if response.status_code in (500, 503):
+        # 503 — model overloaded → trigger fallback after retries
+        if resp.status_code == 503:
             if attempt > MAX_RETRIES:
-                response.raise_for_status()
-            wait = min(BASE_BACKOFF_S * attempt, MAX_BACKOFF_S) + random.uniform(0, JITTER_S)
-            _log(f"[{response.status_code}] Server error. Waiting {wait:.1f}s…")
+                log_fn(f"[503] All retries exhausted for {model}. Trying fallback model.")
+                return None
+            wait = _compute_wait(attempt, None)
+            log_fn(f"[503] SERVICE UNAVAILABLE — {model} overloaded. "
+                   f"Waiting {wait:.1f}s (attempt {attempt+1}/{MAX_RETRIES+1}).")
             time.sleep(wait)
             continue
 
-        # ── Non-retryable error ──────────────────────────────────────────────
-        if not response.ok:
-            _log(f"[ERROR] Non-retryable HTTP {response.status_code}: {response.text[:300]}")
-            response.raise_for_status()
+        # 500 — transient server error
+        if resp.status_code == 500:
+            if attempt > MAX_RETRIES:
+                resp.raise_for_status()
+            wait = _compute_wait(attempt, None)
+            log_fn(f"[500] Internal server error. Waiting {wait:.1f}s…")
+            time.sleep(wait)
+            continue
 
-        # ── Success: navigate the response envelope ──────────────────────────
-        # Gemini REST response shape:
-        # {
-        #   "candidates": [
-        #     { "content": { "parts": [{"text": "<json>"}] } }
-        #   ]
-        # }
+        # 400 — bad request (schema issue, bad key, etc.) — NON-retriable
+        if resp.status_code == 400:
+            log_fn(f"[ERROR] HTTP 400 Bad Request: {resp.text[:400]}")
+            log_fn("[HINT] If error mentions $defs or $ref, schema flattening may have missed a cycle.")
+            resp.raise_for_status()
+
+        # Other 4xx — non-retriable
+        if not resp.ok:
+            log_fn(f"[ERROR] Non-retriable HTTP {resp.status_code}: {resp.text[:300]}")
+            resp.raise_for_status()
+
+        # ── Success ───────────────────────────────────────────────────────────
         try:
-            text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError) as e:
             raise ValueError(
                 f"Unexpected Gemini response structure: {e}. "
-                f"Body: {json.dumps(response.json(), indent=2)[:500]}"
+                f"Body: {json.dumps(resp.json(), indent=2)[:400]}"
             )
 
-        _log(f"[HTTP] Success — received {len(text)} chars of JSON.")
+        log_fn(f"[HTTP] Success — {len(text)} chars from model '{model}'.")
         return text
 
-    # Should never reach here but keeps type-checker happy.
-    raise requests.HTTPError(f"All {MAX_RETRIES} retries exhausted.")
+    return None
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def call_gemini_rest(
+    prompt:          str,
+    api_key:         str,
+    schema:          dict,
+    model:           str  = "gemini-2.5-flash",
+    fallback_models: list[str] | None = None,
+    log_fn:          Callable[[str], None] | None = None,
+    progress_fn:     Callable[[str, int], None]   | None = None,
+) -> str:
+    """
+    Call Gemini generateContent and return raw JSON string.
+
+    The schema is automatically flattened (no $ref/$defs) before sending.
+    """
+    _log = log_fn or _log_default
+
+    if fallback_models is None:
+        fallback_models = DEFAULT_FALLBACK_MODELS
+
+    model_chain = [model] + [m for m in fallback_models if m != model]
+
+    for i, current_model in enumerate(model_chain):
+        if i > 0:
+            _log(f"[FALLBACK] Switching to: {current_model}")
+
+        result = _call_one_model(
+            model       = current_model,
+            prompt      = prompt,
+            api_key     = api_key,
+            schema      = schema,
+            log_fn      = _log,
+            progress_fn = progress_fn,
+        )
+
+        if result is not None:
+            return result
+
+    raise ValueError(
+        f"All models exhausted: {model_chain}. "
+        "Gemini API may be experiencing an outage. Try again in a few minutes."
+    )

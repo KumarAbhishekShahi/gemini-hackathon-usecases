@@ -1,31 +1,14 @@
 """
 sprint_planner.py
 =================
+USE CASE 2: Requirement to Sprint Plan using Gemini Structured Output.
 
-USE CASE 2: Requirement-to-Sprint Plan using Gemini Structured Output
-----------------------------------------------------------------------
-Developer pain point:
-  PMs, clients, and ops leads send vague requirement text via email, Notion,
-  Slack, or meeting notes. A developer lead must manually convert these into
-  user stories, acceptance criteria, test cases, and story point estimates.
-
-What this script does:
-  1. Loads the cleaned requirements CSV produced by prepare_datasets.py.
-  2. Pre-validates every row before sending to Gemini.
-  3. Builds a structured sprint plan (epic, stories, criteria, tests, points).
-  4. Post-validates the response against the Pydantic schema.
-  5. Saves all results as a JSON Lines (.jsonl) file.
-  6. Writes a Markdown summary that can be copied into a wiki or Confluence.
-
-Hackathon demo tip:
-  - Paste one raw requirement text on screen.
-  - Run the script live on 1 record (--limit 1).
-  - Show the full sprint plan with stories, criteria, and test cases.
-  - Then show the generated Markdown file — "ready to paste into Confluence."
+Calls Gemini via the shared REST client (src/common/gemini_client.py).
+No gRPC. No google-genai SDK. Pure HTTP via 'requests'.
 
 Run:
   python src/use_cases/sprint_planner.py
-  python src/use_cases/sprint_planner.py --limit 3
+  python src/use_cases/sprint_planner.py --limit 5
 """
 
 from __future__ import annotations
@@ -37,190 +20,68 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import requests
 from pydantic import BaseModel, Field, ValidationError
 
-# ─── Path setup ───────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from src.common.data_prep import normalize_case
+from src.common.gemini_client import call_gemini_rest as _rest_call
+from src.common.data_prep import normalize_whitespace, safe_fill
 from src.common.validation import require_columns, require_min_rows
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL    = "gemini-2.5-flash"
 CLEAN_DATA_PATH = PROJECT_ROOT / "data" / "clean" / "requirements_clean.csv"
-OUTPUT_DIR = PROJECT_ROOT / "output" / "sprint_planner"
-
+OUTPUT_DIR      = PROJECT_ROOT / "output" / "sprint_planner"
 REQUIRED_COLUMNS = [
     "requirement_id", "raw_requirement_text", "product_area",
-    "requester_role", "business_context", "delivery_window"
+    "requester_role", "business_context", "delivery_window",
 ]
 
-# ─── Input validation ─────────────────────────────────────────────────────────
 
+# ── Pydantic schema ────────────────────────────────────────────────────────
+
+class Story(BaseModel):
+    title: str
+    description: str
+    acceptance_criteria: list[str]
+    test_cases: list[str]
+    dependencies: list[str]
+    estimate_points: int = Field(ge=1, le=21)
+
+class SprintPlan(BaseModel):
+    epic_name: str
+    business_goal: str
+    stories: list[Story] = Field(min_length=1)
+    demo_plan: list[str]
+    risk_flags: list[str]
+
+
+# ── Input / output validation ──────────────────────────────────────────────
 
 def validate_row(row: pd.Series) -> tuple[bool, list[str]]:
-    """
-    Validate a single requirement row before sending to Gemini.
-    Returns (is_valid, list_of_issues).
-    """
     issues = []
-
-    text = str(row.get("raw_requirement_text", "")).strip()
-    if len(text) < 30:
-        issues.append("raw_requirement_text is too short (< 30 chars)")
-
-    product_area = str(row.get("product_area", "")).strip()
-    if not product_area or product_area.lower() == "nan":
-        issues.append("product_area is missing")
-
+    if len(str(row.get("raw_requirement_text", "")).strip()) < 30:
+        issues.append("requirement text too short (< 30 chars)")
+    if not str(row.get("requirement_id", "")).strip():
+        issues.append("requirement_id missing")
     return len(issues) == 0, issues
 
 
-# ─── Pydantic output schema ───────────────────────────────────────────────────
-
-
-class Story(BaseModel):
-    """A single user story with all the fields a developer team needs."""
-
-    title: str = Field(description="Short story title.")
-    description: str = Field(description="Story description in plain language.")
-    acceptance_criteria: list[str] = Field(
-        description="Clear, testable acceptance criteria as a list."
-    )
-    test_cases: list[str] = Field(
-        description="Concrete test cases QA or a developer can execute."
-    )
-    dependencies: list[str] = Field(
-        description="Likely blockers or dependencies. Empty list if none."
-    )
-    estimate_points: int = Field(
-        ge=1, le=21,
-        description="Story points as a small integer (Fibonacci-style: 1,2,3,5,8,13,21)."
-    )
-
-
-class SprintPlan(BaseModel):
-    """Full sprint plan returned by Gemini for a single requirement."""
-
-    epic_name: str = Field(description="Name of the parent epic.")
-    business_goal: str = Field(description="Why this feature matters in one sentence.")
-    stories: list[Story] = Field(
-        min_length=1,
-        description="List of user stories decomposed from the requirement."
-    )
-    demo_plan: list[str] = Field(
-        description="Steps to demo this feature in a hackathon or sprint review."
-    )
-    risk_flags: list[str] = Field(
-        description="Potential risks or assumptions that need clarification."
-    )
-
-
-# ─── Output validation ────────────────────────────────────────────────────────
-
-
 def validate_output(plan: SprintPlan, req_id: str) -> list[str]:
-    """
-    Apply business rules on top of Pydantic validation.
-    Returns a list of warning strings (empty = all clear).
-    """
     warnings = []
-
-    # A meaningful plan must have at least 2 stories.
-    if len(plan.stories) < 2:
-        warnings.append(
-            f"{req_id}: only {len(plan.stories)} story generated. "
-            "Requirement may be too vague — consider adding more detail."
-        )
-
-    # Every story should have at least 1 acceptance criterion.
-    for story in plan.stories:
-        if len(story.acceptance_criteria) == 0:
-            warnings.append(
-                f"{req_id}: story '{story.title}' has no acceptance criteria."
-            )
-        # Story points should be realistic for a 2-week sprint.
-        if story.estimate_points > 13:
-            warnings.append(
-                f"{req_id}: story '{story.title}' has {story.estimate_points} points. "
-                "Consider splitting into smaller stories."
-            )
-
-    # Total sprint points should not exceed a typical team capacity.
-    total_points = sum(s.estimate_points for s in plan.stories)
-    if total_points > 60:
-        warnings.append(
-            f"{req_id}: total estimated points={total_points}. "
-            "This may be too much for a single sprint."
-        )
-
+    total_pts = sum(s.estimate_points for s in plan.stories)
+    if total_pts > 80:
+        warnings.append(f"{req_id}: total points={total_pts} — may be too large for one sprint.")
+    if len(plan.stories) > 10:
+        warnings.append(f"{req_id}: {len(plan.stories)} stories — consider splitting into multiple sprints.")
     return warnings
 
 
-# ─── Markdown writer ──────────────────────────────────────────────────────────
-
-
-def write_markdown(plan: SprintPlan, req_id: str, out_path: Path) -> None:
-    """
-    Convert the structured sprint plan into Markdown so it can be pasted
-    directly into Confluence, Notion, or GitHub wiki.
-    """
-    lines = [
-        f"# Sprint Plan: {plan.epic_name}",
-        "",
-        f"**Requirement ID:** {req_id}  ",
-        f"**Business goal:** {plan.business_goal}",
-        "",
-        "---",
-        "",
-        "## User Stories",
-        "",
-    ]
-    for i, story in enumerate(plan.stories, start=1):
-        lines += [
-            f"### Story {i}: {story.title}",
-            "",
-            f"{story.description}",
-            "",
-            f"**Estimate:** {story.estimate_points} points",
-            "",
-            "**Acceptance Criteria:**",
-        ]
-        for ac in story.acceptance_criteria:
-            lines.append(f"- {ac}")
-        lines += ["", "**Test Cases:**"]
-        for tc in story.test_cases:
-            lines.append(f"- {tc}")
-        if story.dependencies:
-            lines += ["", "**Dependencies:**"]
-            for dep in story.dependencies:
-                lines.append(f"- {dep}")
-        lines.append("")
-
-    if plan.risk_flags:
-        lines += ["## Risk Flags", ""]
-        for risk in plan.risk_flags:
-            lines.append(f"- {risk}")
-        lines.append("")
-
-    if plan.demo_plan:
-        lines += ["## Demo Plan", ""]
-        for step in plan.demo_plan:
-            lines.append(f"- {step}")
-
-    out_path.write_text("\n".join(lines), encoding="utf-8")
-
-
-# ─── Prompt builder ───────────────────────────────────────────────────────────
-
+# ── Prompt builder ─────────────────────────────────────────────────────────
 
 def build_prompt(row: pd.Series) -> str:
-    """
-    Build a structured planning prompt that gives Gemini all available context
-    so the output stories are relevant and actionable.
-    """
     return f"""You are a senior product-minded engineering lead.
 
 Context:
@@ -234,88 +95,86 @@ Raw requirement:
 {row['raw_requirement_text']}
 
 Instructions:
-- Break this down into a practical sprint plan.
-- Write realistic, implementation-friendly user stories.
+- Break into realistic sprint stories with acceptance criteria and test cases.
 - Acceptance criteria must be testable statements.
-- Test cases should be specific enough for a developer or QA to execute.
-- Use conservative story point estimates (Fibonacci: 1,2,3,5,8,13,21).
-- If something is unclear, flag it in risk_flags rather than inventing details.
-- Demo plan should describe what to show in a 5-minute demo.
+- Use Fibonacci story points (1,2,3,5,8,13,21).
+- Flag unclear items in risk_flags rather than inventing details.
+- Output only the requested structured data.
 """
 
 
-# ─── Main processing loop ─────────────────────────────────────────────────────
+# ── REST call (thin wrapper over shared client) ────────────────────────────
+
+def call_gemini(prompt: str, api_key: str) -> str:
+    """Delegates entirely to the shared REST client. No retry logic here."""
+    return _rest_call(
+        prompt  = prompt,
+        api_key = api_key,
+        schema  = SprintPlan.model_json_schema(),
+        model   = GEMINI_MODEL,
+    )
 
 
-def process_requirements(df: pd.DataFrame, client, limit: int) -> dict:
-    """Process each requirement row through Gemini and save structured results."""
+# ── Processing loop ────────────────────────────────────────────────────────
+
+def process_requirements(df: pd.DataFrame, api_key: str, limit: int, batch_size: int) -> dict:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    results_path = OUTPUT_DIR / "sprint_plans.jsonl"
-    markdown_dir = OUTPUT_DIR / "markdown"
-    markdown_dir.mkdir(exist_ok=True)
-    skipped_path = OUTPUT_DIR / "skipped_requirements.json"
+    results_path  = OUTPUT_DIR / "sprint_plan_results.jsonl"
+    skipped_path  = OUTPUT_DIR / "skipped_requirements.json"
     warnings_path = OUTPUT_DIR / "output_warnings.json"
 
     results, skipped, all_warnings = [], [], []
     subset = df.head(limit)
-    print(f"\nProcessing {len(subset)} requirements (limit={limit})...")
+    print(f"\nProcessing {len(subset)} requirements…")
 
     for idx, (_, row) in enumerate(subset.iterrows(), start=1):
-        # ── Pre-validate ─────────────────────────────────────────────────────
         is_valid, issues = validate_row(row)
         if not is_valid:
             print(f"  [SKIP] {row['requirement_id']}: {issues}")
             skipped.append({"requirement_id": row["requirement_id"], "issues": issues})
             continue
 
-        # ── Call Gemini ──────────────────────────────────────────────────────
-        prompt = build_prompt(row)
         try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config={
-                    "response_mime_type": "application/json",
-                    "response_json_schema": SprintPlan.model_json_schema(),
-                },
-            )
-        except Exception as api_error:
-            print(f"  [API ERROR] {row['requirement_id']}: {api_error}")
-            skipped.append({"requirement_id": row["requirement_id"], "issues": [str(api_error)]})
+            raw_json = call_gemini(build_prompt(row), api_key)
+        except requests.HTTPError as e:
+            print(f"  [HTTP ERROR] {row['requirement_id']}: {e}")
+            skipped.append({"requirement_id": row["requirement_id"], "issues": [str(e)]})
             continue
-
-        # ── Validate schema ───────────────────────────────────────────────────
-        try:
-            plan = SprintPlan.model_validate_json(response.text)
-        except (ValidationError, ValueError) as e:
-            print(f"  [SCHEMA ERROR] {row['requirement_id']}: {e}")
+        except requests.Timeout:
+            print(f"  [TIMEOUT] {row['requirement_id']}")
+            skipped.append({"requirement_id": row["requirement_id"], "issues": ["Timeout"]})
+            continue
+        except ValueError as e:
+            print(f"  [RESPONSE ERROR] {row['requirement_id']}: {e}")
             skipped.append({"requirement_id": row["requirement_id"], "issues": [str(e)]})
             continue
 
-        # ── Business warnings ─────────────────────────────────────────────────
+        try:
+            plan = SprintPlan.model_validate_json(raw_json)
+        except (ValidationError, ValueError) as e:
+            print(f"  [SCHEMA ERROR] {row['requirement_id']}: {e}")
+            skipped.append({
+                "requirement_id": row["requirement_id"],
+                "issues": [f"Schema error: {e}"],
+                "raw_response": raw_json[:500],
+            })
+            continue
+
         warnings = validate_output(plan, row["requirement_id"])
         if warnings:
             print(f"  [WARN] {warnings}")
             all_warnings.extend(warnings)
 
-        # ── Save Markdown ─────────────────────────────────────────────────────
-        md_path = markdown_dir / f"{row['requirement_id']}.md"
-        write_markdown(plan, row["requirement_id"], md_path)
-
-        # ── Collect result ────────────────────────────────────────────────────
-        result_dict = {
+        total_pts = sum(s.estimate_points for s in plan.stories)
+        results.append({
             "requirement_id": row["requirement_id"],
-            "product_area": row["product_area"],
             **plan.model_dump(),
-        }
-        results.append(result_dict)
+        })
 
-        total_points = sum(s.estimate_points for s in plan.stories)
-        print(f"  [{idx}/{len(subset)}] {row['requirement_id']} => "
-              f"epic='{plan.epic_name}', stories={len(plan.stories)}, "
-              f"total_points={total_points}")
+        if idx % batch_size == 0 or idx == len(subset):
+            print(f"  [{idx}/{len(subset)}] {row['requirement_id']} => "
+                  f"epic='{plan.epic_name}'  stories={len(plan.stories)}  pts={total_pts}")
 
-    # ── Write outputs ─────────────────────────────────────────────────────────
     with open(results_path, "w", encoding="utf-8") as f:
         for record in results:
             f.write(json.dumps(record) + "\n")
@@ -323,60 +182,55 @@ def process_requirements(df: pd.DataFrame, client, limit: int) -> dict:
     warnings_path.write_text(json.dumps(all_warnings, indent=2), encoding="utf-8")
 
     return {
-        "processed": len(results),
-        "skipped": len(skipped),
-        "warnings": len(all_warnings),
-        "results_file": str(results_path),
-        "markdown_dir": str(markdown_dir),
+        "processed":     len(results),
+        "skipped":       len(skipped),
+        "warnings":      len(all_warnings),
+        "results_file":  str(results_path),
+        "skipped_file":  str(skipped_path),
+        "warnings_file": str(warnings_path),
     }
 
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
+# ── Entry point ────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sprint planner using Gemini")
-    parser.add_argument("--limit", type=int, default=10,
-                        help="Max requirements to process (default: 10)")
+    parser = argparse.ArgumentParser(description="Sprint planner — Gemini REST (requests, no gRPC)")
+    parser.add_argument("--limit",      type=int, default=5,  help="Max requirements to process")
+    parser.add_argument("--batch-size", type=int, default=5,  help="Progress print interval")
     args = parser.parse_args()
 
     print("=" * 70)
-    print("USE CASE 2: REQUIREMENT-TO-SPRINT PLAN WITH GEMINI")
+    print("USE CASE 2: SPRINT PLANNER  (Gemini REST via requests — no gRPC)")
     print("=" * 70)
 
-    print("\n[1/5] Checking GEMINI_API_KEY...")
-    if not os.getenv("GEMINI_API_KEY"):
-        print("ERROR: GEMINI_API_KEY not found. Set it first.")
+    print("\n[1/4] Checking GEMINI_API_KEY…")
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        print("ERROR: Set GEMINI_API_KEY first.\n"
+              "  Linux/macOS : export GEMINI_API_KEY=your_key\n"
+              "  Windows PS  : $env:GEMINI_API_KEY='your_key'")
         sys.exit(1)
-    print("OK: API key found.")
+    print(f"OK  (length={len(api_key)})")
 
-    print("\n[2/5] Importing Gemini SDK...")
-    try:
-        from google import genai
-    except ImportError:
-        print("ERROR: Run  pip install -U google-genai")
-        sys.exit(1)
-    client = genai.Client()
-    print("OK: Gemini client created.")
-
-    print(f"\n[3/5] Loading clean requirements from: {CLEAN_DATA_PATH}")
+    print(f"\n[2/4] Loading {CLEAN_DATA_PATH}…")
     if not CLEAN_DATA_PATH.exists():
         print("ERROR: Run  python scripts/prepare_datasets.py  first.")
         sys.exit(1)
     df = pd.read_csv(CLEAN_DATA_PATH)
     require_columns(df, REQUIRED_COLUMNS, "requirements_clean")
     require_min_rows(df, 1, "requirements_clean")
-    print(f"OK: Loaded {len(df)} rows. Processing first {args.limit}.")
+    print(f"OK  {len(df):,} rows — will process first {args.limit}.")
 
-    print("\n[4/5] Sending requirements to Gemini...")
-    summary = process_requirements(df, client, args.limit)
+    print("\n[3/4] Processing via REST API…")
+    print("      NOTE: free-tier = 10 RPM → 6.5 s throttle active.")
+    print("      503 auto-fallback: gemini-2.5-flash → 2.0-flash → 1.5-flash")
+    summary = process_requirements(df, api_key, args.limit, args.batch_size)
 
-    print("\n[5/5] SUMMARY")
+    print("\n[4/4] SUMMARY")
     print("-" * 70)
     for k, v in summary.items():
-        print(f"  {k:<20}: {v}")
+        print(f"  {k:<18}: {v}")
     print("-" * 70)
-    print("\nDone. Check sprint_plans.jsonl and the markdown/ folder.")
 
 
 if __name__ == "__main__":

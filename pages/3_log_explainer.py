@@ -2,6 +2,7 @@
 pages/3_log_explainer.py
 ========================
 Streamlit page for Use Case 3: Incident Log Explainer.
+Uses shared Gemini REST client — handles 429 + 503 with auto-fallback.
 """
 
 import json
@@ -10,6 +11,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
 from pydantic import BaseModel, Field, ValidationError
 
@@ -17,20 +19,26 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
+from src.common.gemini_client import call_gemini_rest as _rest_call
+
 st.set_page_config(page_title="Log Explainer", page_icon="🔍", layout="wide")
 
 with st.sidebar:
     st.image("https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a690345.svg", width=40)
     st.title("Gemini Dev Use Cases")
     st.markdown("---")
-    api_key = st.text_input(
-        "🔑 Gemini API Key",
-        type="password",
+    api_key_input = st.text_input(
+        "🔑 Gemini API Key", type="password",
         value=st.session_state.get("gemini_api_key", ""),
         placeholder="Paste your key here",
     )
-    if api_key:
-        st.session_state["gemini_api_key"] = api_key
+    if api_key_input:
+        st.session_state["gemini_api_key"] = api_key_input
+    st.markdown("---")
+    st.caption("Transport: **REST (requests)** — no gRPC.")
+    st.caption("Auto-fallback: 2.5-flash → 2.0-flash → 1.5-flash on 503.")
+
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # ── Schema ─────────────────────────────────────────────────────────────────
 class IncidentAnalysis(BaseModel):
@@ -44,15 +52,12 @@ class IncidentAnalysis(BaseModel):
     monitoring_checks: list[str]
     incident_severity: str = Field(pattern=r"^(sev1|sev2|sev3|sev4)$")
 
-# ── Gemini call ─────────────────────────────────────────────────────────────
-def call_gemini(log_text: str, service: str, environment: str, region: str) -> IncidentAnalysis:
-    from google import genai
-    key = st.session_state.get("gemini_api_key","")
-    if not key:
-        raise ValueError("No API key. Enter it in the sidebar.")
-    os.environ["GEMINI_API_KEY"] = key
-    client = genai.Client()
-    prompt = f"""You are a senior site reliability engineer and backend developer.
+# ── Call helper ─────────────────────────────────────────────────────────────
+def call_and_parse(
+    log_text: str, service: str, environment: str, region: str,
+    api_key: str, status_placeholder,
+) -> IncidentAnalysis:
+    prompt = f"""You are a senior SRE and backend developer.
 
 Context:
   Service     : {service}
@@ -63,30 +68,35 @@ Log chunk:
 {log_text}
 
 Instructions:
-- Base your analysis ONLY on the log content above.
-- Do not invent details not present in the logs.
+- Base analysis ONLY on the log content above. Do not invent details.
 - Evidence lines must quote or closely paraphrase actual log content.
-- Immediate actions must be safe (no destructive operations without confirmation).
-- Assign incident_severity as: sev1 (full outage), sev2 (major degradation), sev3 (minor), sev4 (informational).
-- If the log is incomplete, say so in what_happened and lower your confidence.
+- Immediate actions must be safe (no destructive ops without confirmation).
+- incident_severity: sev1=full outage, sev2=major degradation, sev3=minor, sev4=informational.
+- If log is incomplete, say so and lower your confidence.
 """
-    response = client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": IncidentAnalysis.model_json_schema(),
-        },
+    def st_log(msg: str) -> None:
+        if any(k in msg for k in ("429", "503", "RATE", "FALLBACK", "THROTTLE", "Waiting", "overloaded")):
+            status_placeholder.warning(f"⏳ {msg}", icon="⏳")
+        else:
+            status_placeholder.info(f"🔄 {msg}")
+
+    raw = _rest_call(
+        prompt=prompt, api_key=api_key,
+        schema=IncidentAnalysis.model_json_schema(),
+        model=GEMINI_MODEL, log_fn=st_log,
     )
-    return IncidentAnalysis.model_validate_json(response.text)
+    return IncidentAnalysis.model_validate_json(raw)
 
 # ── Render ─────────────────────────────────────────────────────────────────
-SEV_COLORS = {"sev1":"🔴 SEV1 — Critical Outage","sev2":"🟠 SEV2 — Major Degradation",
-              "sev3":"🟡 SEV3 — Minor Issue","sev4":"🟢 SEV4 — Informational"}
+SEV_LABELS = {
+    "sev1": "🔴 SEV1 — Critical Outage",
+    "sev2": "🟠 SEV2 — Major Degradation",
+    "sev3": "🟡 SEV3 — Minor Issue",
+    "sev4": "🟢 SEV4 — Informational",
+}
 
 def render_result(analysis: IncidentAnalysis, incident_id: str = "CUSTOM") -> None:
-    # Severity banner
-    sev_label = SEV_COLORS.get(analysis.incident_severity, analysis.incident_severity)
+    sev_label = SEV_LABELS.get(analysis.incident_severity, analysis.incident_severity)
     if analysis.incident_severity == "sev1":
         st.error(f"**{sev_label}** — Component: `{analysis.affected_component}`", icon="🚨")
     elif analysis.incident_severity == "sev2":
@@ -94,7 +104,7 @@ def render_result(analysis: IncidentAnalysis, incident_id: str = "CUSTOM") -> No
     else:
         st.info(f"**{sev_label}** — Component: `{analysis.affected_component}`", icon="ℹ️")
 
-    m1, m2 = st.columns([3,1])
+    m1, m2 = st.columns([3, 1])
     m1.markdown(f"**🎯 Probable Root Cause:** {analysis.probable_root_cause}")
     m2.metric("Confidence", f"{analysis.confidence}/100")
 
@@ -103,15 +113,13 @@ def render_result(analysis: IncidentAnalysis, incident_id: str = "CUSTOM") -> No
     st.markdown("---")
 
     col_l, col_r = st.columns(2)
-
     with col_l:
         st.markdown("### 🔎 Evidence Lines")
         if analysis.evidence_lines:
             for ev in analysis.evidence_lines:
                 st.code(ev, language="text")
         else:
-            st.caption("_No specific evidence lines found in the provided log._")
-
+            st.caption("_No specific evidence lines found._")
         st.markdown("### 🛑 Immediate Actions")
         for i, action in enumerate(analysis.immediate_actions, 1):
             st.markdown(f"{i}. {action}")
@@ -122,20 +130,16 @@ def render_result(analysis: IncidentAnalysis, incident_id: str = "CUSTOM") -> No
             for fix in analysis.code_fix_suggestions:
                 st.markdown(f"- {fix}")
         else:
-            st.caption("_No code fixes identified from the provided log._")
-
+            st.caption("_No code fixes identified._")
         st.markdown("### 📊 Monitoring Checks")
         if analysis.monitoring_checks:
             for check in analysis.monitoring_checks:
                 st.markdown(f"- {check}")
-        else:
-            st.caption("_No monitoring suggestions returned._")
 
-    # Build runbook Markdown
-    runbook_lines = [
+    runbook = "\n".join([
         f"# Incident Runbook: {incident_id}", "",
-        f"**Severity:** `{analysis.incident_severity}`  ",
-        f"**Component:** {analysis.affected_component}  ",
+        f"**Severity:** `{analysis.incident_severity}`",
+        f"**Component:** {analysis.affected_component}",
         f"**Confidence:** {analysis.confidence}/100", "",
         "## What Happened", "", analysis.what_happened, "",
         "## Probable Root Cause", "", analysis.probable_root_cause, "",
@@ -145,22 +149,24 @@ def render_result(analysis: IncidentAnalysis, incident_id: str = "CUSTOM") -> No
     ] + [f"{i}. {a}" for i, a in enumerate(analysis.immediate_actions, 1)] + [
         "", "## Code Fix Suggestions", "",
     ] + [f"- {f}" for f in analysis.code_fix_suggestions] + [
-        "", "## Monitoring Checks to Add", "",
-    ] + [f"- {c}" for c in analysis.monitoring_checks]
-    runbook_md = "
-".join(runbook_lines)
-    json_str   = analysis.model_dump_json(indent=2)
+        "", "## Monitoring Checks", "",
+    ] + [f"- {c}" for c in analysis.monitoring_checks])
 
     st.markdown("---")
     c1, c2 = st.columns(2)
-    c1.download_button("⬇️ Download Runbook (Markdown)", data=runbook_md,
+    c1.download_button("⬇️ Download Runbook (Markdown)", data=runbook,
                        file_name=f"runbook_{incident_id}.md", mime="text/markdown")
-    c2.download_button("⬇️ Download JSON", data=json_str,
+    c2.download_button("⬇️ Download JSON", data=analysis.model_dump_json(indent=2),
                        file_name=f"incident_{incident_id}.json", mime="application/json")
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Page ───────────────────────────────────────────────────────────────────
+st.info(
+    "**503 auto-fallback active:** if `gemini-2.5-flash` is overloaded the client "
+    "automatically retries with `gemini-2.0-flash` → `gemini-1.5-flash`.",
+    icon="ℹ️",
+)
 st.title("🔍 Use Case 3: Incident Log Explainer")
-st.caption("Paste logs or a stack trace → root-cause hypothesis, evidence, actions, and a downloadable runbook.")
+st.caption("Logs/stack trace → root-cause, evidence, actions, downloadable runbook.")
 
 mode = st.radio("Input mode:", ["✍️ Paste log / stack trace", "📂 Load from CSV"], horizontal=True)
 
@@ -187,54 +193,62 @@ java.lang.RuntimeException: pricing lookup failed
         submitted   = st.form_submit_button("🚀 Explain with Gemini", type="primary")
 
     if submitted:
+        key = st.session_state.get("gemini_api_key","")
         if len(log_text.strip()) < 40:
-            st.error("Log text is too short to analyse meaningfully.")
-        elif not st.session_state.get("gemini_api_key"):
-            st.error("Please enter your Gemini API key in the sidebar first.")
+            st.error("Log text is too short.")
+        elif not key:
+            st.error("Enter your Gemini API key in the sidebar first.")
         else:
-            with st.spinner("Gemini is analysing the logs…"):
+            status = st.empty()
+            with st.spinner("Calling Gemini REST API…"):
                 try:
-                    analysis = call_gemini(log_text, service, environment, region)
+                    analysis = call_and_parse(log_text, service, environment, region, key, status)
+                    status.empty()
                     st.success("Analysis complete!", icon="✅")
                     render_result(analysis)
+                except requests.HTTPError as e:
+                    status.empty()
+                    st.error(f"HTTP error: {e}")
                 except (ValidationError, ValueError) as e:
-                    st.error(f"Validation error: {e}")
-                except Exception as e:
-                    st.error(f"API error: {e}")
+                    status.empty()
+                    st.error(f"Error: {e}")
 
 else:
     csv_path = PROJECT_ROOT / "data" / "clean" / "logs_clean.csv"
     if not csv_path.exists():
-        st.error("Clean data not found. Run `python scripts/prepare_datasets.py` first.")
+        st.error("Run `python scripts/prepare_datasets.py` first.")
     else:
         df = pd.read_csv(csv_path)
         env_filter = st.selectbox("Filter by environment:", ["all","prod","qa","dev"])
         if env_filter != "all":
             df = df[df["environment"] == env_filter].reset_index(drop=True)
         st.info(f"Showing **{len(df):,} records**")
-
         row_idx = st.slider("Select incident row", 0, min(len(df)-1, 999), 0)
         row = df.iloc[row_idx]
-
         with st.expander("👁️ Preview raw log chunk", expanded=True):
-            st.markdown(f"**Incident ID:** `{row['incident_id']}`  |  **Service:** {row.get('service_name','—')}  |  **Env:** {row.get('environment','—')}")
+            st.markdown(f"**ID:** `{row['incident_id']}`  |  **Service:** {row.get('service_name','—')}  |  **Env:** {row.get('environment','—')}")
             st.code(str(row["log_chunk"]), language="text")
-
         if st.button("🚀 Explain this incident with Gemini", type="primary"):
-            if not st.session_state.get("gemini_api_key"):
-                st.error("Please enter your Gemini API key in the sidebar first.")
+            key = st.session_state.get("gemini_api_key","")
+            if not key:
+                st.error("Enter your Gemini API key in the sidebar first.")
             else:
-                with st.spinner("Gemini is analysing the logs…"):
+                status = st.empty()
+                with st.spinner("Calling Gemini REST API…"):
                     try:
-                        analysis = call_gemini(
+                        analysis = call_and_parse(
                             str(row["log_chunk"]),
                             str(row.get("service_name","unknown")),
                             str(row.get("environment","prod")),
                             str(row.get("region","IN")),
+                            key, status,
                         )
+                        status.empty()
                         st.success("Analysis complete!", icon="✅")
                         render_result(analysis, str(row["incident_id"]))
+                    except requests.HTTPError as e:
+                        status.empty()
+                        st.error(f"HTTP error: {e}")
                     except (ValidationError, ValueError) as e:
-                        st.error(f"Validation error: {e}")
-                    except Exception as e:
-                        st.error(f"API error: {e}")
+                        status.empty()
+                        st.error(f"Error: {e}")
